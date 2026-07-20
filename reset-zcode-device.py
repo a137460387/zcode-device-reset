@@ -332,12 +332,6 @@ def main() -> int:
         result_code = 0
 
     print(c_cyan("=" * 40))
-
-    if sys.stdout.isatty():
-        try:
-            input("Press Enter to exit...")
-        except EOFError:
-            pass
     return result_code
 
 
