@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """ZCode Device ID Reset Tool.
 
-Resets the ZCode telemetry device ID by terminating running ZCode processes,
-deleting the telemetry-state.json file, then relaunching ZCode so a fresh
-deviceMid is generated.
+Resets the ZCode telemetry device ID by:
+1. Reading the current deviceMid
+2. Disconnecting the account (deleting credentials.json)
+3. Terminating running ZCode processes
+4. Deleting the telemetry-state.json file
+5. Relaunching ZCode so a fresh deviceMid is generated
+6. Verifying the new deviceMid
 
 Standard library only - no dependencies to install.
 
 Usage:
     python reset-zcode-device.py            # run the full reset
     python reset-zcode-device.py --dry-run  # show what would happen, change nothing
+    python reset-zcode-device.py --no-launch  # reset without relaunching ZCode
 """
 
 from __future__ import annotations
@@ -28,6 +33,17 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 TELEMETRY_PATH = Path.home() / ".zcode" / "v2" / "telemetry-state.json"
+CREDENTIALS_PATH = Path.home() / ".zcode" / "v2" / "credentials.json"
+
+# Credential keys belonging to the Zhipu AI / BigModel OAuth login session.
+# Removing these logs the user out while preserving bot credentials,
+# remote-control keys, and custom provider configs.
+ZHIPU_CREDENTIAL_KEYS = [
+    "oauth:bigmodel:access_token",
+    "oauth:bigmodel:user_info",
+    "oauth:active_provider",
+    "zcodejwttoken",
+]
 
 # Executable names we look for when killing processes.
 PROCESS_NAMES = ["ZCode", "zcode", "zcode-helper", "zcode-cli"]
@@ -97,6 +113,46 @@ def read_device_mid(path: Path) -> str:
         print(c_red(f"   Failed to parse telemetry file: {exc}"))
         return "N/A"
     return str(data.get("deviceMid", "N/A"))
+
+
+def disconnect_account(dry_run: bool) -> bool:
+    """Remove Zhipu AI OAuth credentials to log out while preserving custom providers.
+
+    Reads credentials.json, strips the Zhipu-specific keys, and writes back.
+    Returns True on success (or dry-run).
+    """
+    if not CREDENTIALS_PATH.exists():
+        print(c_gray("   credentials.json not found, already disconnected."))
+        return True
+
+    try:
+        data = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(c_red(f"   Failed to read credentials: {exc}"))
+        return False
+
+    keys_to_remove = [k for k in ZHIPU_CREDENTIAL_KEYS if k in data]
+    if not keys_to_remove:
+        print(c_gray("   No Zhipu AI credentials found, already disconnected."))
+        return True
+
+    if dry_run:
+        for k in keys_to_remove:
+            print(c_gray(f"   [dry-run] would remove key: {k}"))
+        return True
+
+    for k in keys_to_remove:
+        del data[k]
+
+    try:
+        CREDENTIALS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(c_green(f"   Removed {len(keys_to_remove)} Zhipu AI credential key(s)."))
+        print(c_gray("   Custom providers and other credentials preserved."))
+        print(c_gray("   ZCode will detect the logout and may restart."))
+        return True
+    except OSError as exc:
+        print(c_red(f"   Failed to write credentials: {exc}"))
+        return False
 
 
 def kill_zcode_processes(dry_run: bool) -> None:
@@ -193,7 +249,7 @@ def main() -> int:
     print()
 
     # Step 1: read current deviceMid
-    print(c_yellow("[1/5] Reading current deviceMid..."))
+    print(c_yellow("[1/6] Reading current deviceMid..."))
     old_mid = read_device_mid(TELEMETRY_PATH)
     if TELEMETRY_PATH.exists():
         print(c_green(f"   Current deviceMid: {old_mid}"))
@@ -201,16 +257,25 @@ def main() -> int:
         print(c_gray("   telemetry-state.json not found."))
     print()
 
-    # Step 2: terminate ZCode processes
-    print(c_yellow("[2/5] Terminating all zcode processes..."))
+    # Step 2: disconnect account
+    print(c_yellow("[2/6] Disconnecting account..."))
+    if not disconnect_account(args.dry_run):
+        print(c_red("   Failed to disconnect account. Aborting."))
+        return 1
+    if not args.dry_run:
+        time.sleep(KILL_WAIT_SEC)
+    print()
+
+    # Step 3: terminate ZCode processes
+    print(c_yellow("[3/6] Terminating all zcode processes..."))
     kill_zcode_processes(args.dry_run)
     if not args.dry_run:
         time.sleep(KILL_WAIT_SEC)
     print(c_green("   Done."))
     print()
 
-    # Step 3: delete telemetry file
-    print(c_yellow("[3/5] Deleting telemetry-state.json..."))
+    # Step 4: delete telemetry file
+    print(c_yellow("[4/6] Deleting telemetry-state.json..."))
     if TELEMETRY_PATH.exists():
         if args.dry_run:
             print(c_gray(f"   [dry-run] would delete {TELEMETRY_PATH}"))
@@ -221,31 +286,33 @@ def main() -> int:
         print(c_gray("   File not found, skipping."))
     print()
 
-    # Step 4: launch ZCode
+    # Step 5: launch ZCode
     if args.no_launch:
-        print(c_yellow("[4/5] Skipping launch (--no-launch)."))
-        new_mid = "N/A (launch skipped)"
+        print(c_yellow("[5/6] Skipping launch (--no-launch)."))
     else:
-        print(c_yellow("[4/5] Launching zcode..."))
+        print(c_yellow("[5/6] Launching zcode..."))
         launched = launch_zcode(args.dry_run)
         if launched:
             print(c_gray(f"   Waiting for zcode to initialize ({LAUNCH_WAIT_SEC}s)..."))
             if not args.dry_run:
                 time.sleep(LAUNCH_WAIT_SEC)
-        print()
+    print()
 
-        # Step 5: verify new deviceMid
-        print(c_yellow("[5/5] Checking new deviceMid..."))
-        if TELEMETRY_PATH.exists():
-            new_mid = read_device_mid(TELEMETRY_PATH)
-            print(c_green(f"   New deviceMid: {new_mid}"))
-        elif args.dry_run:
-            new_mid = "N/A (dry-run)"
-            print(c_gray("   [dry-run] file would be regenerated by ZCode"))
-        else:
-            new_mid = "N/A"
-            print(c_red("   telemetry-state.json not yet created."))
-            print(c_yellow("   Please wait and re-run this script to verify."))
+    # Step 6: verify new deviceMid
+    print(c_yellow("[6/6] Checking new deviceMid..."))
+    if args.no_launch:
+        new_mid = "N/A (launch skipped)"
+        print(c_gray("   Skipped - ZCode was not launched."))
+    elif TELEMETRY_PATH.exists():
+        new_mid = read_device_mid(TELEMETRY_PATH)
+        print(c_green(f"   New deviceMid: {new_mid}"))
+    elif args.dry_run:
+        new_mid = "N/A (dry-run)"
+        print(c_gray("   [dry-run] file would be regenerated by ZCode"))
+    else:
+        new_mid = "N/A"
+        print(c_red("   telemetry-state.json not yet created."))
+        print(c_yellow("   Please wait and re-run this script to verify."))
 
     # Result
     print()
