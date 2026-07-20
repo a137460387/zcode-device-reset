@@ -3,8 +3,8 @@
 
 Resets the ZCode telemetry device ID by:
 1. Reading the current deviceMid
-2. Disconnecting the account (deleting credentials.json)
-3. Terminating running ZCode processes
+2. Terminating running ZCode processes
+3. Disconnecting the account (removing OAuth credentials)
 4. Deleting the telemetry-state.json file
 5. Relaunching ZCode so a fresh deviceMid is generated
 6. Verifying the new deviceMid
@@ -65,6 +65,15 @@ LAUNCH_WAIT_SEC = 10
 # ---------------------------------------------------------------------------
 
 _COLOR_ENABLED = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+# Enable ANSI escape code processing on Windows.
+if _COLOR_ENABLED and os.name == "nt":
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        _COLOR_ENABLED = False
 
 
 def _color(code: str, text: str) -> str:
@@ -257,21 +266,19 @@ def main() -> int:
         print(c_gray("   telemetry-state.json not found."))
     print()
 
-    # Step 2: disconnect account
-    print(c_yellow("[2/6] Disconnecting account..."))
-    if not disconnect_account(args.dry_run):
-        print(c_red("   Failed to disconnect account. Aborting."))
-        return 1
-    if not args.dry_run:
-        time.sleep(KILL_WAIT_SEC)
-    print()
-
-    # Step 3: terminate ZCode processes
-    print(c_yellow("[3/6] Terminating all zcode processes..."))
+    # Step 2: terminate ZCode processes
+    print(c_yellow("[2/6] Terminating all zcode processes..."))
     kill_zcode_processes(args.dry_run)
     if not args.dry_run:
         time.sleep(KILL_WAIT_SEC)
     print(c_green("   Done."))
+    print()
+
+    # Step 3: disconnect account (ZCode is already dead, no auto-restart)
+    print(c_yellow("[3/6] Disconnecting account..."))
+    if not disconnect_account(args.dry_run):
+        print(c_red("   Failed to disconnect account. Aborting."))
+        return 1
     print()
 
     # Step 4: delete telemetry file

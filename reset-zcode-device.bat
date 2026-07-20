@@ -5,6 +5,7 @@ REM This lets users double-click the .bat while all logic lives in the .py file.
 
 setlocal
 set "SCRIPT_DIR=%~dp0"
+cd /d "%SCRIPT_DIR%"
 
 REM Prefer `python`, fall back to `py` launcher (bundled with Python installer on Windows).
 where python >nul 2>&1
