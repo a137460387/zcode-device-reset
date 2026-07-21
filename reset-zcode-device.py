@@ -717,7 +717,13 @@ def get_api_key() -> str | None:
 
 
 def get_user_id_from_token(api_key: str) -> str | None:
-    """Extract user_id from JWT token payload."""
+    """Extract user_id from JWT token payload.
+
+    SECURITY: No JWT signature verification is performed — the payload is
+    simply base64-decoded.  user_id is used only as a backup-file dictionary
+    key (save_account_backup / switch_account / auto_switch_account) and is
+    never trusted for authorization decisions.
+    """
     try:
         parts = api_key.split(".")
         if len(parts) != 3:
