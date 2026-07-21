@@ -195,6 +195,14 @@ def save_account_backup(dry_run: bool) -> dict | None:
     """
     device_mid = read_device_mid(TELEMETRY_PATH)
     api_key = get_api_key()
+    provider_type = get_provider_type()
+
+    # Show provider type
+    type_display = {
+        "bigmodel": "BigModel (China)",
+        "zai": "Z.ai (Global)",
+    }.get(provider_type, "Unknown")
+    print(c_cyan(f"   Provider: {type_display}"))
 
     # Get user_id from JWT token
     user_id = get_user_id_from_token(api_key) if api_key else None
@@ -270,6 +278,7 @@ def save_account_backup(dry_run: bool) -> dict | None:
     backup = {
         "userId": user_id,
         "deviceMid": device_mid,
+        "provider": provider_type,
         "credentials": oauth_creds,
         "plan": plan_info,
         "savedAt": datetime.now().strftime("%Y-%m-%d"),
@@ -322,6 +331,11 @@ def list_account_backups() -> int:
         saved_at = backup.get("savedAt", "")
         is_current = " (current)" if uid == current_uid else ""
         device_mid = backup.get("deviceMid", "N/A")
+        provider = backup.get("provider", "unknown")
+        provider_display = {
+            "bigmodel": "BigModel",
+            "zai": "Z.ai",
+        }.get(provider, provider)
         creds = backup.get("credentials", {})
         has_token = "token" if creds.get("zcodejwttoken") else "no-token"
 
@@ -331,6 +345,7 @@ def list_account_backups() -> int:
         checked_at = plan.get("checkedAt", "")
 
         print(c_green(f"   [{i}] user: {uid}{is_current}"))
+        print(c_gray(f"       provider: {provider_display}"))
         print(c_gray(f"       device: {device_mid}"))
         print(c_gray(f"       saved: {saved_at}, auth: {has_token}"))
         if plan_name:
@@ -381,8 +396,10 @@ def switch_account(uid: str, dry_run: bool) -> int:
             print(c_red(f"   Failed to read current credentials: {exc}"))
             return 1
 
-    # Merge: overwrite OAuth keys, keep others
-    merged = {**current_creds, **saved_creds}
+    # Merge: remove all OAuth keys first, then add saved ones
+    # This prevents conflicts between different provider types (bigmodel vs zai)
+    merged = {k: v for k, v in current_creds.items() if k not in OAUTH_CREDENTIAL_KEYS}
+    merged.update(saved_creds)
 
     print(c_gray(f"   Restoring {len(saved_creds)} credential key(s):"))
     for k in saved_creds:
@@ -407,6 +424,17 @@ def switch_account(uid: str, dry_run: bool) -> int:
         print(c_red(f"   Failed to write credentials: {exc}"))
         return 1
 
+    # Update config.json to enable the correct provider
+    provider_type = backup.get("provider", "")
+    # Fallback: detect from credential keys for old backups
+    if not provider_type:
+        if "oauth:zai:access_token" in saved_creds:
+            provider_type = "zai"
+        elif "oauth:bigmodel:access_token" in saved_creds:
+            provider_type = "bigmodel"
+    if provider_type and not update_provider_config(provider_type, dry_run):
+        print(c_yellow("   Warning: Failed to update provider config. ZCode may need manual re-login."))
+
     # Delete telemetry so ZCode re-registers
     if TELEMETRY_PATH.exists():
         TELEMETRY_PATH.unlink()
@@ -415,7 +443,22 @@ def switch_account(uid: str, dry_run: bool) -> int:
     # Relaunch ZCode
     print(c_yellow("   Starting ZCode..."))
     if launch_zcode(False):
-        print(c_green(f"   Switched to account: {uid}"))
+        # Verify provider is still enabled after ZCode startup
+        if provider_type:
+            time.sleep(LAUNCH_WAIT_SEC)
+            if not verify_provider_enabled(provider_type):
+                print(c_yellow("   ZCode disabled the provider. Re-enabling..."))
+                update_provider_config(provider_type, False)
+                kill_zcode_processes(False)
+                time.sleep(KILL_WAIT_SEC)
+                if launch_zcode(False):
+                    print(c_green(f"   Switched to account: {uid} (provider re-enabled)"))
+                else:
+                    print(c_yellow("   Credentials restored, but ZCode launch failed. Start manually."))
+            else:
+                print(c_green(f"   Switched to account: {uid}"))
+        else:
+            print(c_green(f"   Switched to account: {uid}"))
     else:
         print(c_yellow("   Credentials restored, but ZCode launch failed. Start manually."))
 
@@ -605,6 +648,103 @@ def clear_config_api_keys(dry_run: bool) -> bool:
         return True
 
 
+def update_provider_config(provider_type: str, dry_run: bool) -> bool:
+    """Update config.json to enable the correct plan provider.
+
+    provider_type: 'bigmodel' or 'zai'
+    Returns True on success (or dry-run).
+    """
+    if not CONFIG_PATH.exists():
+        print(c_gray("   config.json not found, skipping."))
+        return True
+
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(c_red(f"   Failed to read config.json: {exc}"))
+        return False
+
+    providers = data.get("provider", {})
+    plan_providers = [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")]
+
+    if dry_run:
+        print(c_gray(f"   [dry-run] would enable {provider_type} providers"))
+        return True
+
+    modified = 0
+    for key in plan_providers:
+        is_target = provider_type in key
+        provider = providers[key]
+
+        if is_target:
+            # Enable this provider and clear apiKey for re-auth
+            if not provider.get("enabled"):
+                provider["enabled"] = True
+                modified += 1
+            if "systemDisabledReason" in provider:
+                del provider["systemDisabledReason"]
+                modified += 1
+            # Clear apiKey so ZCode will re-authenticate with OAuth token
+            options = provider.get("options", {})
+            if options.get("apiKey"):
+                options["apiKey"] = ""
+                modified += 1
+        else:
+            # Disable other providers and clear their apiKeys
+            if provider.get("enabled"):
+                provider["enabled"] = False
+                modified += 1
+            options = provider.get("options", {})
+            if options.get("apiKey"):
+                options["apiKey"] = ""
+                modified += 1
+
+    if modified:
+        try:
+            CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(c_green(f"   Updated provider config for {provider_type}."))
+        except OSError as exc:
+            print(c_red(f"   Failed to write config.json: {exc}"))
+            return False
+    else:
+        print(c_gray("   Provider config already up to date."))
+
+    # Update providerFamilyDomain in setting.json
+    if SETTING_PATH.exists():
+        try:
+            setting_data = json.loads(SETTING_PATH.read_text(encoding="utf-8"))
+            current_domain = setting_data.get("providerFamilyDomain", "")
+            if current_domain != provider_type:
+                setting_data["providerFamilyDomain"] = provider_type
+                SETTING_PATH.write_text(
+                    json.dumps(setting_data, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                print(c_green(f"   Updated providerFamilyDomain to {provider_type}."))
+        except (OSError, ValueError) as exc:
+            print(c_yellow(f"   Warning: Failed to update setting.json: {exc}"))
+
+    return True
+
+
+def verify_provider_enabled(provider_type: str) -> bool:
+    """Check if the target provider is enabled after ZCode startup.
+
+    Returns True if at least one plan provider of the given type is enabled.
+    """
+    if not CONFIG_PATH.exists():
+        return False
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    providers = data.get("provider", {})
+    for key, val in providers.items():
+        if key.startswith("builtin:") and key.endswith("-plan") and provider_type in key:
+            if val.get("enabled"):
+                return True
+    return False
+
+
 def update_coding_plan_cache(dry_run: bool) -> bool:
     """Update coding-plan-cache.json to mark all plan providers as unavailable.
 
@@ -708,7 +848,10 @@ def get_api_key() -> str | None:
     except (OSError, ValueError):
         return None
     providers = data.get("provider", {})
-    plan_keys = [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")]
+    plan_keys = sorted(
+        [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")],
+        key=lambda k: (0 if "start-plan" in k else 1),
+    )
 
     fallback_key = None
     for key in plan_keys:
@@ -720,6 +863,32 @@ def get_api_key() -> str | None:
         if fallback_key is None:
             fallback_key = api_key
     return fallback_key
+
+
+def get_provider_type() -> str:
+    """Detect current OAuth provider type: 'bigmodel', 'zai', or 'unknown'."""
+    if not CONFIG_PATH.exists():
+        return "unknown"
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unknown"
+    providers = data.get("provider", {})
+    plan_keys = sorted(
+        [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")],
+        key=lambda k: (0 if "start-plan" in k else 1),
+    )
+
+    fallback = None
+    for key in plan_keys:
+        api_key = providers[key].get("options", {}).get("apiKey") or None
+        if not api_key:
+            continue
+        if providers[key].get("enabled"):
+            return "zai" if "zai" in key else "bigmodel" if "bigmodel" in key else "unknown"
+        if fallback is None:
+            fallback = "zai" if "zai" in key else "bigmodel" if "bigmodel" in key else "unknown"
+    return fallback or "unknown"
 
 
 def get_user_id_from_token(api_key: str) -> str | None:
