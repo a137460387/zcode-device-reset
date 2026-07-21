@@ -40,6 +40,11 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
+# Fix Windows console encoding for Chinese characters
+if os.name == "nt":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
