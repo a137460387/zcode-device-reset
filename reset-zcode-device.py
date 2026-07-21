@@ -59,7 +59,6 @@ ACCOUNT_BACKUP_PATH = Path(__file__).parent / "account-backups.json"
 LOGS_DIR = Path.home() / ".zcode" / "v2" / "logs"
 
 BILLING_API_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.3.6"
-PLAN_PROVIDER_KEY = "builtin:bigmodel-start-plan"
 
 # Credential keys belonging to the Zhipu AI / BigModel OAuth login session.
 # Removing these logs the user out while preserving bot credentials,
@@ -132,6 +131,38 @@ def banner(text: str) -> None:
     print(c_cyan("=" * 40))
     print(c_cyan(text))
     print(c_cyan("=" * 40))
+
+
+def restrict_file_permissions(path: Path) -> None:
+    """Tighten a file's permissions to owner-only.
+
+    Best-effort: prints a warning if it cannot be applied.
+      * POSIX: chmod 0600 (clears group/other read bits).
+      * Windows: os.chmod only toggles the readonly bit, so we instead
+        rewrite the ACL via icacls to grant full control only to the
+        current user (and SYSTEM/Administrators), removing inherited
+        access from Everyone / other accounts.
+    """
+    if os.name == "nt":
+        user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+        # Reset inheritance, then grant only the current user.
+        cmd = ["icacls", str(path), "/inheritance:r"]
+        if user:
+            cmd += ["/grant:r", f"{user}:F"]
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            print(c_yellow(f"   Warning: could not tighten ACL: {exc}"))
+    else:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            print(c_yellow(f"   Warning: could not tighten file permissions: {exc}"))
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +281,9 @@ def save_account_backup(dry_run: bool) -> dict | None:
         ACCOUNT_BACKUP_PATH.write_text(
             json.dumps(backups, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        # The file holds OAuth tokens (encrypted by ZCode, but still sensitive).
+        # Tighten permissions so other users on the host cannot read it.
+        restrict_file_permissions(ACCOUNT_BACKUP_PATH)
         print(c_green(f"   Saved account backup: {ACCOUNT_BACKUP_PATH}"))
         print(c_gray(f"   user_id: {user_id}"))
         print(c_gray(f"   credentials: {list(oauth_creds.keys())}"))
@@ -385,9 +419,15 @@ def switch_account(uid: str, dry_run: bool) -> int:
 def auto_switch_account(dry_run: bool) -> int:
     """Auto switch to an unused account with valid plan.
 
-    Criteria:
-    1. Plan not expired (endsAt > now)
-    2. Not used today (checkedAt is not today)
+    Filter criteria:
+      1. Plan not expired (endsAt > now)
+      2. Not used today (checkedAt is not today)
+
+    When multiple accounts qualify, the best one is picked deterministically:
+      - Latest endsAt first  (most remaining time, use it before shorter ones)
+      - Then earliest checkedAt (longest since last use)
+      - Then ascending uid (stable tie-breaker, identical across runs)
+    This avoids the previous behavior of depending on JSON file insertion order.
     """
     if not ACCOUNT_BACKUP_PATH.exists():
         print(c_red("   No account backups found."))
@@ -408,6 +448,7 @@ def auto_switch_account(dry_run: bool) -> int:
 
     api_key = get_api_key()
     current_uid = get_user_id_from_token(api_key) if api_key else None
+    # Each entry: (ends_ts, checked_ts, uid, backup) — see sort below.
     candidates = []
 
     for uid, backup in backups.items():
@@ -418,37 +459,51 @@ def auto_switch_account(dry_run: bool) -> int:
         if not plan:
             continue
 
+        # Parse to timestamps (integers) for cross-platform sorting.
+        # datetime.min.timestamp() raises OSError on Windows (out of tz range),
+        # so we use explicit integer sentinels instead.
         ends_at_str = plan.get("endsAt", "")
+        ends_ts = -1  # missing -> lowest priority (sorts last under DESC)
         if ends_at_str:
             try:
                 ends_at = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
                 if ends_at < now:
                     continue
+                ends_ts = int(ends_at.timestamp())
             except ValueError:
                 continue
 
         checked_at_str = plan.get("checkedAt", "")
+        checked_ts = -1  # missing -> treated as never used (highest priority)
         if checked_at_str:
             try:
                 checked_at = datetime.strptime(checked_at_str, "%Y-%m-%d %H:%M:%S")
                 if checked_at >= today_start:
                     continue
+                checked_ts = int(checked_at.timestamp())
             except ValueError:
                 continue
 
-        candidates.append((uid, backup))
+        candidates.append((ends_ts, checked_ts, uid, backup))
 
     if not candidates:
         print(c_yellow("   No available accounts found."))
         print(c_gray("   Requirements: plan not expired, not used today."))
         return 1
 
-    best_uid, best_backup = candidates[0]
+    # Sort: ends_ts DESC (latest expiry first), checked_ts ASC (oldest use first),
+    # uid ASC (deterministic tie-breaker). Together this is fully deterministic
+    # regardless of JSON file insertion order.
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+
+    _, _, best_uid, best_backup = candidates[0]
     plan = best_backup.get("plan", {})
     ends_str = plan.get("endsAt", "N/A")
 
     print(c_green(f"   Found account: {best_uid}"))
     print(c_gray(f"   Plan: {plan.get('planName', 'N/A')}, expires: {ends_str}"))
+    if len(candidates) > 1:
+        print(c_gray(f"   ({len(candidates)} candidates, picked by: latest expiry, then least-recently-used)"))
 
     return switch_account(best_uid, dry_run)
 
@@ -627,15 +682,38 @@ def clear_provider_family_domain(dry_run: bool) -> bool:
 
 
 def get_api_key() -> str | None:
-    """Read the JWT API key from config.json for the active plan provider."""
+    """Read the JWT API key from config.json for the active plan provider.
+
+    A user may be logged in under any of the builtin plan providers
+    (bigmodel-start-plan, bigmodel-coding-plan, zai-start-plan,
+    zai-coding-plan, ...). ZCode keeps the OAuth JWT in exactly one of
+    them at a time, so we cannot hardcode a single key name.
+
+    Selection order:
+      1. The enabled builtin:*-plan provider with a non-empty apiKey.
+      2. Otherwise, any builtin:*-plan provider with a non-empty apiKey
+         (covers the brief window during reset when all are disabled
+         but the key has not yet been cleared).
+    """
     if not CONFIG_PATH.exists():
         return None
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    provider = data.get("provider", {}).get(PLAN_PROVIDER_KEY, {})
-    return provider.get("options", {}).get("apiKey") or None
+    providers = data.get("provider", {})
+    plan_keys = [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")]
+
+    fallback_key = None
+    for key in plan_keys:
+        api_key = providers[key].get("options", {}).get("apiKey") or None
+        if not api_key:
+            continue
+        if providers[key].get("enabled"):
+            return api_key
+        if fallback_key is None:
+            fallback_key = api_key
+    return fallback_key
 
 
 def get_user_id_from_token(api_key: str) -> str | None:
@@ -750,7 +828,6 @@ def display_plan_status(data: dict) -> None:
 
     for b in balances:
         name = b.get("show_name", b.get("entitlement_id", "?"))
-        used = b.get("used_units", 0)
         total = b.get("total_units", 0)
         remaining = b.get("remaining_units", 0)
         pct = round(remaining / total * 100) if total else 0
@@ -932,6 +1009,25 @@ def main() -> int:
         help="backup current account credentials and plan info, then exit",
     )
     args = parser.parse_args()
+
+    # --status / --list-accounts / --switch / --auto-switch / --backup each
+    # run a single action and exit; combining them is ambiguous because the
+    # code only honors the first one in source order. Reject up front with a
+    # clear message instead of silently ignoring the rest.
+    # (--dry-run and --no-launch are modifiers, not actions, so they are
+    # allowed alongside any action.)
+    selected_actions = [
+        ("--status", args.status),
+        ("--list-accounts", args.list_accounts),
+        ("--switch", args.switch is not None),
+        ("--auto-switch", args.auto_switch),
+        ("--backup", args.backup),
+    ]
+    chosen = [name for name, active in selected_actions if active]
+    if len(chosen) > 1:
+        parser.error(
+            f"arguments {' and '.join(chosen)} are mutually exclusive; pick one"
+        )
 
     banner("ZCode Device ID Reset Tool")
 
