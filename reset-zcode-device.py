@@ -5,9 +5,12 @@ Resets the ZCode telemetry device ID by:
 1. Reading the current deviceMid
 2. Terminating running ZCode processes
 3. Disconnecting the account (removing OAuth credentials)
-4. Deleting the telemetry-state.json file
-5. Relaunching ZCode so a fresh deviceMid is generated
-6. Verifying the new deviceMid
+4. Clearing plan provider API keys in config.json
+5. Updating coding-plan-cache.json to mark plans as unavailable
+6. Removing providerFamilyDomain from setting.json
+7. Deleting the telemetry-state.json file
+8. Relaunching ZCode so a fresh deviceMid is generated
+9. Verifying the new deviceMid
 
 Standard library only - no dependencies to install.
 
@@ -34,6 +37,9 @@ from pathlib import Path
 
 TELEMETRY_PATH = Path.home() / ".zcode" / "v2" / "telemetry-state.json"
 CREDENTIALS_PATH = Path.home() / ".zcode" / "v2" / "credentials.json"
+CONFIG_PATH = Path.home() / ".zcode" / "v2" / "config.json"
+CODING_PLAN_CACHE_PATH = Path.home() / ".zcode" / "v2" / "coding-plan-cache.json"
+SETTING_PATH = Path.home() / ".zcode" / "v2" / "setting.json"
 
 # Credential keys belonging to the Zhipu AI / BigModel OAuth login session.
 # Removing these logs the user out while preserving bot credentials,
@@ -164,6 +170,139 @@ def disconnect_account(dry_run: bool) -> bool:
         return False
 
 
+def clear_config_api_keys(dry_run: bool) -> bool:
+    """Clear API keys for all builtin plan providers in config.json.
+
+    Sets apiKey to empty string, enabled to false, and adds systemDisabledReason.
+    Returns True on success (or dry-run).
+    """
+    if not CONFIG_PATH.exists():
+        print(c_gray("   config.json not found, skipping."))
+        return True
+
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(c_red(f"   Failed to read config.json: {exc}"))
+        return False
+
+    providers = data.get("provider", {})
+    plan_providers = [k for k in providers if k.startswith("builtin:") and k.endswith("-plan")]
+
+    if not plan_providers:
+        print(c_gray("   No builtin plan providers found, skipping."))
+        return True
+
+    if dry_run:
+        for k in plan_providers:
+            print(c_gray(f"   [dry-run] would clear apiKey for: {k}"))
+        return True
+
+    modified = 0
+    for key in plan_providers:
+        provider = providers[key]
+        options = provider.get("options", {})
+        if options.get("apiKey"):
+            options["apiKey"] = ""
+            modified += 1
+        provider["enabled"] = False
+        provider["systemDisabledReason"] = "coding_plan_not_authenticated"
+
+    if modified:
+        try:
+            CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(c_green(f"   Cleared {modified} plan provider API key(s)."))
+            return True
+        except OSError as exc:
+            print(c_red(f"   Failed to write config.json: {exc}"))
+            return False
+    else:
+        print(c_gray("   No API keys to clear."))
+        return True
+
+
+def update_coding_plan_cache(dry_run: bool) -> bool:
+    """Update coding-plan-cache.json to mark all plan providers as unavailable.
+
+    Returns True on success (or dry-run).
+    """
+    if not CODING_PLAN_CACHE_PATH.exists():
+        print(c_gray("   coding-plan-cache.json not found, skipping."))
+        return True
+
+    try:
+        data = json.loads(CODING_PLAN_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(c_red(f"   Failed to read coding-plan-cache.json: {exc}"))
+        return False
+
+    items = data.get("entryStatus", {}).get("items", {})
+    plan_items = {k: v for k, v in items.items() if k.startswith("builtin:") and k.endswith("-plan")}
+
+    if not plan_items:
+        print(c_gray("   No plan entries in cache, skipping."))
+        return True
+
+    if dry_run:
+        for k in plan_items:
+            print(c_gray(f"   [dry-run] would mark {k} as unavailable"))
+        return True
+
+    modified = 0
+    for key, item in plan_items.items():
+        if item.get("status") != "unavailable" or item.get("reason") != "coding_plan_not_authenticated":
+            item["status"] = "unavailable"
+            item["reason"] = "coding_plan_not_authenticated"
+            modified += 1
+
+    if modified:
+        data["entryStatus"]["updatedAt"] = int(time.time() * 1000)
+        try:
+            CODING_PLAN_CACHE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(c_green(f"   Updated {modified} cache entry(ies)."))
+            return True
+        except OSError as exc:
+            print(c_red(f"   Failed to write coding-plan-cache.json: {exc}"))
+            return False
+    else:
+        print(c_gray("   Cache entries already up to date."))
+        return True
+
+
+def clear_provider_family_domain(dry_run: bool) -> bool:
+    """Remove providerFamilyDomain from setting.json.
+
+    Returns True on success (or dry-run).
+    """
+    if not SETTING_PATH.exists():
+        print(c_gray("   setting.json not found, skipping."))
+        return True
+
+    try:
+        data = json.loads(SETTING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(c_red(f"   Failed to read setting.json: {exc}"))
+        return False
+
+    if "providerFamilyDomain" not in data:
+        print(c_gray("   providerFamilyDomain not found, already cleared."))
+        return True
+
+    if dry_run:
+        print(c_gray(f"   [dry-run] would remove providerFamilyDomain: {data['providerFamilyDomain']}"))
+        return True
+
+    del data["providerFamilyDomain"]
+
+    try:
+        SETTING_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(c_green("   Removed providerFamilyDomain."))
+        return True
+    except OSError as exc:
+        print(c_red(f"   Failed to write setting.json: {exc}"))
+        return False
+
+
 def kill_zcode_processes(dry_run: bool) -> None:
     """Terminate every known ZCode process."""
     if os.name == "nt":
@@ -258,7 +397,7 @@ def main() -> int:
     print()
 
     # Step 1: read current deviceMid
-    print(c_yellow("[1/6] Reading current deviceMid..."))
+    print(c_yellow("[1/9] Reading current deviceMid..."))
     old_mid = read_device_mid(TELEMETRY_PATH)
     if TELEMETRY_PATH.exists():
         print(c_green(f"   Current deviceMid: {old_mid}"))
@@ -267,7 +406,7 @@ def main() -> int:
     print()
 
     # Step 2: terminate ZCode processes
-    print(c_yellow("[2/6] Terminating all zcode processes..."))
+    print(c_yellow("[2/9] Terminating all zcode processes..."))
     kill_zcode_processes(args.dry_run)
     if not args.dry_run:
         time.sleep(KILL_WAIT_SEC)
@@ -275,14 +414,35 @@ def main() -> int:
     print()
 
     # Step 3: disconnect account (ZCode is already dead, no auto-restart)
-    print(c_yellow("[3/6] Disconnecting account..."))
+    print(c_yellow("[3/9] Disconnecting account..."))
     if not disconnect_account(args.dry_run):
         print(c_red("   Failed to disconnect account. Aborting."))
         return 1
     print()
 
-    # Step 4: delete telemetry file
-    print(c_yellow("[4/6] Deleting telemetry-state.json..."))
+    # Step 4: clear plan provider API keys in config.json
+    print(c_yellow("[4/9] Clearing plan provider API keys..."))
+    if not clear_config_api_keys(args.dry_run):
+        print(c_red("   Failed to clear API keys. Aborting."))
+        return 1
+    print()
+
+    # Step 5: update coding-plan-cache.json
+    print(c_yellow("[5/9] Updating plan cache..."))
+    if not update_coding_plan_cache(args.dry_run):
+        print(c_red("   Failed to update plan cache. Aborting."))
+        return 1
+    print()
+
+    # Step 6: remove providerFamilyDomain from setting.json
+    print(c_yellow("[6/9] Clearing provider family domain..."))
+    if not clear_provider_family_domain(args.dry_run):
+        print(c_red("   Failed to clear provider family domain. Aborting."))
+        return 1
+    print()
+
+    # Step 7: delete telemetry file
+    print(c_yellow("[7/9] Deleting telemetry-state.json..."))
     if TELEMETRY_PATH.exists():
         if args.dry_run:
             print(c_gray(f"   [dry-run] would delete {TELEMETRY_PATH}"))
@@ -293,11 +453,11 @@ def main() -> int:
         print(c_gray("   File not found, skipping."))
     print()
 
-    # Step 5: launch ZCode
+    # Step 8: launch ZCode
     if args.no_launch:
-        print(c_yellow("[5/6] Skipping launch (--no-launch)."))
+        print(c_yellow("[8/9] Skipping launch (--no-launch)."))
     else:
-        print(c_yellow("[5/6] Launching zcode..."))
+        print(c_yellow("[8/9] Launching zcode..."))
         launched = launch_zcode(args.dry_run)
         if launched:
             print(c_gray(f"   Waiting for zcode to initialize ({LAUNCH_WAIT_SEC}s)..."))
@@ -305,8 +465,8 @@ def main() -> int:
                 time.sleep(LAUNCH_WAIT_SEC)
     print()
 
-    # Step 6: verify new deviceMid
-    print(c_yellow("[6/6] Checking new deviceMid..."))
+    # Step 9: verify new deviceMid
+    print(c_yellow("[9/9] Checking new deviceMid..."))
     if args.no_launch:
         new_mid = "N/A (launch skipped)"
         print(c_gray("   Skipped - ZCode was not launched."))
