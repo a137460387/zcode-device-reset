@@ -4,3 +4,9 @@ debug.log
 # Python
 __pycache__/
 *.pyc
+
+# Local ZCode config
+.zcode/
+
+# Account backups (contains encrypted credentials)
+account-backups.json
