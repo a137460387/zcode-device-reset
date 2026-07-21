@@ -60,12 +60,18 @@ LOGS_DIR = Path.home() / ".zcode" / "v2" / "logs"
 
 BILLING_API_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.3.6"
 
-# Credential keys belonging to the Zhipu AI / BigModel OAuth login session.
+# Credential keys belonging to OAuth login sessions.
+# Supports both BigModel (China) and Z.ai (global) providers.
 # Removing these logs the user out while preserving bot credentials,
 # remote-control keys, and custom provider configs.
-ZHIPU_CREDENTIAL_KEYS = [
+OAUTH_CREDENTIAL_KEYS = [
+    # BigModel (China)
     "oauth:bigmodel:access_token",
     "oauth:bigmodel:user_info",
+    # Z.ai (global)
+    "oauth:zai:access_token",
+    "oauth:zai:user_info",
+    # Shared
     "oauth:active_provider",
     "zcodejwttoken",
 ]
@@ -201,7 +207,7 @@ def save_account_backup(dry_run: bool) -> dict | None:
     if CREDENTIALS_PATH.exists():
         try:
             all_creds = json.loads(CREDENTIALS_PATH.read_text(encoding="utf-8"))
-            oauth_creds = {k: v for k, v in all_creds.items() if k in ZHIPU_CREDENTIAL_KEYS}
+            oauth_creds = {k: v for k, v in all_creds.items() if k in OAUTH_CREDENTIAL_KEYS}
         except (OSError, ValueError) as exc:
             print(c_red(f"   Failed to read credentials: {exc}"))
 
@@ -509,9 +515,9 @@ def auto_switch_account(dry_run: bool) -> int:
 
 
 def disconnect_account(dry_run: bool) -> bool:
-    """Remove Zhipu AI OAuth credentials to log out while preserving custom providers.
+    """Remove OAuth credentials to log out while preserving custom providers.
 
-    Reads credentials.json, strips the Zhipu-specific keys, and writes back.
+    Reads credentials.json, strips the OAuth-specific keys, and writes back.
     Returns True on success (or dry-run).
     """
     if not CREDENTIALS_PATH.exists():
@@ -524,9 +530,9 @@ def disconnect_account(dry_run: bool) -> bool:
         print(c_red(f"   Failed to read credentials: {exc}"))
         return False
 
-    keys_to_remove = [k for k in ZHIPU_CREDENTIAL_KEYS if k in data]
+    keys_to_remove = [k for k in OAUTH_CREDENTIAL_KEYS if k in data]
     if not keys_to_remove:
-        print(c_gray("   No Zhipu AI credentials found, already disconnected."))
+        print(c_gray("   No OAuth credentials found, already disconnected."))
         return True
 
     if dry_run:
@@ -539,7 +545,7 @@ def disconnect_account(dry_run: bool) -> bool:
 
     try:
         CREDENTIALS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(c_green(f"   Removed {len(keys_to_remove)} Zhipu AI credential key(s)."))
+        print(c_green(f"   Removed {len(keys_to_remove)} OAuth credential key(s)."))
         print(c_gray("   Custom providers and other credentials preserved."))
         print(c_gray("   ZCode will detect the logout and may restart."))
         return True
