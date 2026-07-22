@@ -145,16 +145,24 @@ def restrict_file_permissions(path: Path) -> None:
     Best-effort: prints a warning if it cannot be applied.
       * POSIX: chmod 0600 (clears group/other read bits).
       * Windows: os.chmod only toggles the readonly bit, so we instead
-        rewrite the ACL via icacls to grant full control only to the
-        current user (and SYSTEM/Administrators), removing inherited
-        access from Everyone / other accounts.
+        rewrite the ACL via icacls to grant full control to the current
+        user plus SYSTEM/Administrators (so AV/backup services still
+        function), removing inherited access from Everyone / others.
     """
     if os.name == "nt":
-        user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
-        # Reset inheritance, then grant only the current user.
+        # Prefer getpass.getuser() (queries the OS security database)
+        # over the USERNAME env var, which is user-writable and can be
+        # empty or spoofed.
+        import getpass
+        user = getpass.getuser()
+        # Reset inheritance, then grant only the current user + standard
+        # service accounts.
         cmd = ["icacls", str(path), "/inheritance:r"]
+        grants = ["SYSTEM:F", "Administrators:F"]
         if user:
-            cmd += ["/grant:r", f"{user}:F"]
+            grants.append(f"{user}:F")
+        for g in grants:
+            cmd += ["/grant:r", g]
         try:
             subprocess.run(
                 cmd,
@@ -169,6 +177,53 @@ def restrict_file_permissions(path: Path) -> None:
             os.chmod(path, 0o600)
         except OSError as exc:
             print(c_yellow(f"   Warning: could not tighten file permissions: {exc}"))
+
+
+def write_json_secure(path: Path, data, restrict: bool = True) -> bool:
+    """Write JSON atomically with owner-only permissions.
+
+    Steps (in order) to avoid leaving a sensitive file on disk in a
+    permissive state even momentarily:
+      1. Create a temp file in the SAME directory (so os.replace is
+         atomic on the same filesystem).
+      2. Immediately restrict its permissions (BEFORE writing content).
+      3. Write the JSON content.
+      4. Atomically replace the destination via os.replace.
+
+    Returns True on success, False on failure (temp file cleaned up).
+    """
+    import tempfile
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # ~/.zcode/v2 normally already exists; ignore mkdir failure
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=".tmp", dir=str(parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        os.close(tmp_fd)
+        if restrict:
+            restrict_file_permissions(tmp_path)
+        # Write content with explicit UTF-8 (matches read encoding).
+        tmp_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(tmp_path, path)
+        # os.replace preserves the (now-restricted) ACL of the temp file.
+        return True
+    except OSError as exc:
+        # Rollback: remove the temp file so no half-written / permissive
+        # artifact lingers on disk.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        print(c_red(f"   Failed to write {path.name}: {exc}"))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +293,13 @@ def save_account_backup(dry_run: bool) -> dict | None:
             "startsAt": datetime.fromtimestamp(starts_at).strftime("%Y-%m-%d %H:%M:%S") if starts_at else "",
             "endsAt": datetime.fromtimestamp(ends_at).strftime("%Y-%m-%d %H:%M:%S") if ends_at else "",
             "checkedAt": datetime.fromtimestamp(checked_at).strftime("%Y-%m-%d %H:%M:%S") if checked_at else "",
+            # Raw Unix timestamps (seconds). auto_switch_account compares
+            # against these instead of the local-tz strings above, so
+            # expiry / "used today" decisions are unaffected by the host
+            # timezone or DST changes when the device moves regions.
+            "startsAtTs": int(starts_at) if starts_at else 0,
+            "endsAtTs": int(ends_at) if ends_at else 0,
+            "checkedAtTs": int(checked_at) if checked_at else 0,
             "source": "log",
         }
         ends_str = datetime.fromtimestamp(ends_at).strftime("%Y-%m-%d") if ends_at else "N/A"
@@ -259,6 +321,9 @@ def save_account_backup(dry_run: bool) -> dict | None:
                     "startsAt": datetime.fromtimestamp(starts_at).strftime("%Y-%m-%d %H:%M:%S") if starts_at else "",
                     "endsAt": datetime.fromtimestamp(ends_at).strftime("%Y-%m-%d %H:%M:%S") if ends_at else "",
                     "checkedAt": datetime.fromtimestamp(server_time).strftime("%Y-%m-%d %H:%M:%S") if server_time else "",
+                    "startsAtTs": int(starts_at) if starts_at else 0,
+                    "endsAtTs": int(ends_at) if ends_at else 0,
+                    "checkedAtTs": int(server_time) if server_time else 0,
                     "source": "api",
                 }
                 ends_str = datetime.fromtimestamp(ends_at).strftime("%Y-%m-%d") if ends_at else "N/A"
@@ -292,20 +357,12 @@ def save_account_backup(dry_run: bool) -> dict | None:
         print(c_gray(f"   [dry-run] credentials: {list(oauth_creds.keys())}"))
         return backup
 
-    try:
-        ACCOUNT_BACKUP_PATH.write_text(
-            json.dumps(backups, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        # The file holds OAuth tokens (encrypted by ZCode, but still sensitive).
-        # Tighten permissions so other users on the host cannot read it.
-        restrict_file_permissions(ACCOUNT_BACKUP_PATH)
+    if write_json_secure(ACCOUNT_BACKUP_PATH, backups):
         print(c_green(f"   Saved account backup: {ACCOUNT_BACKUP_PATH}"))
         print(c_gray(f"   user_id: {user_id}"))
         print(c_gray(f"   credentials: {list(oauth_creds.keys())}"))
         return backup
-    except OSError as exc:
-        print(c_red(f"   Failed to save backup: {exc}"))
-        return None
+    return None
 
 
 def list_account_backups() -> int:
@@ -368,6 +425,13 @@ def switch_account(uid: str, dry_run: bool) -> int:
         print(c_red(f"   Failed to read backups: {exc}"))
         return 1
 
+    # Capture the account we are switching AWAY from before any state changes.
+    # After credentials are rewritten get_api_key()/JWT would report the NEW
+    # account, so we resolve the leaving account's uid now and stamp it as
+    # "used today" after a successful switch (see _mark_account_used_today).
+    leaving_api_key = get_api_key()
+    leaving_uid = get_user_id_from_token(leaving_api_key) if leaving_api_key else None
+
     # Support 'last' keyword: pick the most recently saved
     if uid == "last":
         if not backups:
@@ -415,14 +479,9 @@ def switch_account(uid: str, dry_run: bool) -> int:
     time.sleep(KILL_WAIT_SEC)
 
     # Write credentials
-    try:
-        CREDENTIALS_PATH.write_text(
-            json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-        print(c_green("   Credentials restored."))
-    except OSError as exc:
-        print(c_red(f"   Failed to write credentials: {exc}"))
+    if not write_json_secure(CREDENTIALS_PATH, merged):
         return 1
+    print(c_green("   Credentials restored."))
 
     # Update config.json to enable the correct provider
     provider_type = backup.get("provider", "")
@@ -462,17 +521,153 @@ def switch_account(uid: str, dry_run: bool) -> int:
     else:
         print(c_yellow("   Credentials restored, but ZCode launch failed. Start manually."))
 
+    # Mark accounts as "used today" so the next random/auto switch doesn't
+    # immediately bounce back to them.
+    # 1. Mark the account we switched away from.
+    if leaving_uid and leaving_uid != uid and leaving_uid in backups:
+        if _mark_account_used_today(backups, leaving_uid):
+            print(c_gray(f"   Marked {leaving_uid} as used today."))
+    # 2. Mark the account we just switched TO.
+    if uid in backups:
+        if _mark_account_used_today(backups, uid):
+            print(c_gray(f"   Marked {uid} as used today."))
+
     return 0
+
+
+def _load_backups_silent() -> dict | None:
+    """Load account-backups.json without any console output.
+
+    For callers (collect_candidates, external scripts) that need the data
+    but don't want the colored status messages produced by the action
+    functions. Returns None when the file is missing or unparseable.
+    """
+    if not ACCOUNT_BACKUP_PATH.exists():
+        return None
+    try:
+        return json.loads(ACCOUNT_BACKUP_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _mark_account_used_today(backups: dict, uid: str) -> bool:
+    """Stamp a backup's plan.checkedAt(->now) so it counts as "used today".
+
+    Used when switching AWAY from an account: the just-left account should
+    not be picked again until tomorrow, even though --backup (the only
+    other writer of checkedAt) may not run for a while.
+
+    Updates both the raw-ts field (checkedAtTs) and the local-tz string
+    (checkedAt) to mirror save_account_backup's output shape, then writes
+    the whole backups file back with the same secure writer. Returns True
+    on success, False on any error (callers ignore failures here so a
+    bookkeeping miss never blocks the actual switch).
+    """
+    if uid not in backups:
+        return False
+    plan = backups[uid].get("plan")
+    if not isinstance(plan, dict):
+        plan = {}
+        backups[uid]["plan"] = plan
+    now = datetime.now()
+    now_ts = int(now.timestamp())
+    plan["checkedAtTs"] = now_ts
+    plan["checkedAt"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return write_json_secure(ACCOUNT_BACKUP_PATH, backups)
+    except Exception:
+        return False
+
+
+def _parse_plan_ts(plan: dict, int_key: str, str_key: str) -> int | None:
+    """Resolve a plan timestamp to a Unix int.
+
+    Prefer the raw integer field (saved by newer tool versions, immune
+    to host timezone/DST). Fall back to parsing the local-tz string
+    for backups written by older versions.
+    Returns None when the field is absent or unparseable.
+    """
+    ts = plan.get(int_key)
+    if isinstance(ts, (int, float)) and ts > 0:
+        return int(ts)
+    s = plan.get(str_key, "")
+    if s:
+        try:
+            return int(datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp())
+        except ValueError:
+            return None
+    return None
+
+
+def collect_candidates(backups: dict | None = None) -> list[tuple[int, int, str, dict]]:
+    """Return switchable account candidates, sorted deterministically.
+
+    Shared by auto_switch_account() and the external random-pick.py so the
+    filter logic stays in one place.
+
+    Filter criteria (account is dropped):
+      - equals the current account (identified via get_api_key/JWT)
+      - has no plan info
+      - plan expired (endsAt <= now)
+      - already used today (checkedAt >= local midnight)
+
+    Each returned tuple is (ends_ts, checked_ts, uid, backup). Sorted by:
+      ends_ts DESC  (most remaining time first)
+      checked_ts ASC (longest since last use)
+      uid ASC       (stable tie-breaker, identical across runs)
+    Missing timestamps are mapped to -1 so they sort last under this order
+    (and never trip the expired/used-today guards).
+    """
+    if backups is None:
+        backups = _load_backups_silent() or {}
+
+    now = datetime.now()
+    now_ts = int(now.timestamp())
+    # Today's local-midnight as a Unix timestamp (used to detect "already
+    # used today"). We deliberately compare against the device's local day
+    # boundary so that "today" follows the user's clock.
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_ts = int(today_start.timestamp())
+
+    api_key = get_api_key()
+    current_uid = get_user_id_from_token(api_key) if api_key else None
+
+    candidates: list[tuple[int, int, str, dict]] = []
+    for uid, backup in backups.items():
+        if uid == current_uid:
+            continue
+
+        plan = backup.get("plan", {})
+        if not plan:
+            continue
+
+        # Compare raw Unix timestamps where possible. This keeps expiry /
+        # "used today" decisions correct even if the device's timezone
+        # changes between runs (string values were written in the then-local
+        # tz and would otherwise be reinterpreted in the now-local tz).
+        ends_ts = _parse_plan_ts(plan, "endsAtTs", "endsAt")
+        if ends_ts is None:
+            ends_ts = -1  # missing -> lowest priority (sorts last under DESC)
+        elif ends_ts <= now_ts:
+            continue  # expired
+
+        checked_ts = _parse_plan_ts(plan, "checkedAtTs", "checkedAt")
+        if checked_ts is None:
+            checked_ts = -1  # missing -> treated as never used (highest priority)
+        elif checked_ts >= today_start_ts:
+            continue  # already used today
+
+        candidates.append((ends_ts, checked_ts, uid, backup))
+
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    return candidates
 
 
 def auto_switch_account(dry_run: bool) -> int:
     """Auto switch to an unused account with valid plan.
 
-    Filter criteria:
-      1. Plan not expired (endsAt > now)
-      2. Not used today (checkedAt is not today)
-
-    When multiple accounts qualify, the best one is picked deterministically:
+    Selection uses collect_candidates(); among the candidates it picks the
+    best one deterministically:
       - Latest endsAt first  (most remaining time, use it before shorter ones)
       - Then earliest checkedAt (longest since last use)
       - Then ascending uid (stable tie-breaker, identical across runs)
@@ -492,58 +687,12 @@ def auto_switch_account(dry_run: bool) -> int:
         print(c_red("   No backups available."))
         return 1
 
-    now = datetime.now()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    api_key = get_api_key()
-    current_uid = get_user_id_from_token(api_key) if api_key else None
-    # Each entry: (ends_ts, checked_ts, uid, backup) — see sort below.
-    candidates = []
-
-    for uid, backup in backups.items():
-        if uid == current_uid:
-            continue
-
-        plan = backup.get("plan", {})
-        if not plan:
-            continue
-
-        # Parse to timestamps (integers) for cross-platform sorting.
-        # datetime.min.timestamp() raises OSError on Windows (out of tz range),
-        # so we use explicit integer sentinels instead.
-        ends_at_str = plan.get("endsAt", "")
-        ends_ts = -1  # missing -> lowest priority (sorts last under DESC)
-        if ends_at_str:
-            try:
-                ends_at = datetime.strptime(ends_at_str, "%Y-%m-%d %H:%M:%S")
-                if ends_at < now:
-                    continue
-                ends_ts = int(ends_at.timestamp())
-            except ValueError:
-                continue
-
-        checked_at_str = plan.get("checkedAt", "")
-        checked_ts = -1  # missing -> treated as never used (highest priority)
-        if checked_at_str:
-            try:
-                checked_at = datetime.strptime(checked_at_str, "%Y-%m-%d %H:%M:%S")
-                if checked_at >= today_start:
-                    continue
-                checked_ts = int(checked_at.timestamp())
-            except ValueError:
-                continue
-
-        candidates.append((ends_ts, checked_ts, uid, backup))
+    candidates = collect_candidates(backups)
 
     if not candidates:
         print(c_yellow("   No available accounts found."))
         print(c_gray("   Requirements: plan not expired, not used today."))
         return 1
-
-    # Sort: ends_ts DESC (latest expiry first), checked_ts ASC (oldest use first),
-    # uid ASC (deterministic tie-breaker). Together this is fully deterministic
-    # regardless of JSON file insertion order.
-    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
 
     _, _, best_uid, best_backup = candidates[0]
     plan = best_backup.get("plan", {})
@@ -586,15 +735,12 @@ def disconnect_account(dry_run: bool) -> bool:
     for k in keys_to_remove:
         del data[k]
 
-    try:
-        CREDENTIALS_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(c_green(f"   Removed {len(keys_to_remove)} OAuth credential key(s)."))
-        print(c_gray("   Custom providers and other credentials preserved."))
-        print(c_gray("   ZCode will detect the logout and may restart."))
-        return True
-    except OSError as exc:
-        print(c_red(f"   Failed to write credentials: {exc}"))
+    if not write_json_secure(CREDENTIALS_PATH, data):
         return False
+    print(c_green(f"   Removed {len(keys_to_remove)} OAuth credential key(s)."))
+    print(c_gray("   Custom providers and other credentials preserved."))
+    print(c_gray("   ZCode will detect the logout and may restart."))
+    return True
 
 
 def clear_config_api_keys(dry_run: bool) -> bool:
@@ -904,9 +1050,10 @@ def get_user_id_from_token(api_key: str) -> str | None:
         if len(parts) != 3:
             return None
         payload = parts[1]
-        # Add padding
-        payload += "=" * (4 - len(payload) % 4)
-        decoded = base64.b64decode(payload)
+        # JWT uses base64url without padding. Pad to a multiple of 4 so
+        # urlsafe_b64decode accepts any segment length.
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
         data = json.loads(decoded)
         return str(data.get("user_id", ""))
     except Exception:
