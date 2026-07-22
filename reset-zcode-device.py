@@ -528,16 +528,13 @@ def switch_account(uid: str, dry_run: bool) -> int:
     else:
         print(c_yellow("   Credentials restored, but ZCode launch failed. Start manually."))
 
-    # Mark accounts as "used today" so the next random/auto switch doesn't
-    # immediately bounce back to them.
-    # 1. Mark the account we switched away from.
+    # Mark the account we switched away from as "used today" so the next
+    # random/auto switch doesn't immediately bounce back to it.
+    # The target account is excluded from selection as "current", so it
+    # does not need a "used today" mark.
     if leaving_uid and leaving_uid != uid and leaving_uid in backups:
         if _mark_account_used_today(backups, leaving_uid):
             print(c_gray(f"   Marked {leaving_uid} as used today."))
-    # 2. Mark the account we just switched TO.
-    if uid in backups:
-        if _mark_account_used_today(backups, uid):
-            print(c_gray(f"   Marked {uid} as used today."))
 
     return 0
 
