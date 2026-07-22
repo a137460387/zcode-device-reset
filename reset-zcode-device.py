@@ -507,11 +507,18 @@ def switch_account(uid: str, dry_run: bool) -> int:
             time.sleep(LAUNCH_WAIT_SEC)
             if not verify_provider_enabled(provider_type):
                 print(c_yellow("   ZCode disabled the provider. Re-enabling..."))
+                # Re-write credentials (ZCode may have overwritten them)
+                write_json_secure(CREDENTIALS_PATH, merged)
                 update_provider_config(provider_type, False)
                 kill_zcode_processes(False)
                 time.sleep(KILL_WAIT_SEC)
                 if launch_zcode(False):
-                    print(c_green(f"   Switched to account: {uid} (provider re-enabled)"))
+                    time.sleep(LAUNCH_WAIT_SEC)
+                    if not verify_provider_enabled(provider_type):
+                        print(c_yellow("   Provider still disabled after retry."))
+                        print(c_yellow("   Try manually logging in via ZCode UI."))
+                    else:
+                        print(c_green(f"   Switched to account: {uid} (provider re-enabled)"))
                 else:
                     print(c_yellow("   Credentials restored, but ZCode launch failed. Start manually."))
             else:
